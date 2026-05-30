@@ -44,6 +44,7 @@ use rustfs_ecstore::bucket::{
     replication::{get_must_replicate_options, must_replicate, schedule_replication},
     versioning_sys::BucketVersioningSys,
 };
+#[cfg(test)]
 use rustfs_ecstore::client::constants::ABS_MIN_PART_SIZE;
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::compress::is_compressible;
@@ -149,7 +150,7 @@ fn complete_multipart_size_for_quota(uploaded_parts: &[CompletePart], stored_par
     let part_lookup: HashMap<usize, &PartInfo> = stored_parts.iter().map(|part| (part.part_num, part)).collect();
     let mut completed_size = 0u64;
 
-    for (idx, uploaded_part) in uploaded_parts.iter().enumerate() {
+    for uploaded_part in uploaded_parts {
         let stored_part = part_lookup.get(&uploaded_part.part_num)?;
         let client_etag = uploaded_part.etag.as_ref().map(|etag| rustfs_utils::path::trim_etag(etag));
         let stored_etag = stored_part.etag.as_ref().map(|etag| rustfs_utils::path::trim_etag(etag));
@@ -162,9 +163,6 @@ fn complete_multipart_size_for_quota(uploaded_parts: &[CompletePart], stored_par
         } else {
             stored_part.size as u64
         };
-        if idx < uploaded_parts.len() - 1 && stored_part_size < ABS_MIN_PART_SIZE as u64 {
-            return None;
-        }
 
         completed_size = completed_size.saturating_add(stored_part_size);
     }
@@ -1695,6 +1693,43 @@ mod tests {
         assert_eq!(
             complete_multipart_size_for_quota(&uploaded_parts, &stored_parts),
             Some(ABS_MIN_PART_SIZE as u64 + 15)
+        );
+    }
+
+    #[test]
+    fn complete_multipart_size_for_quota_does_not_validate_min_part_size() {
+        let short_part_size = (ABS_MIN_PART_SIZE - 1) as usize;
+        let uploaded_parts = vec![
+            CompletePart {
+                part_num: 1,
+                etag: Some("etag-1".to_string()),
+                ..Default::default()
+            },
+            CompletePart {
+                part_num: 2,
+                etag: Some("etag-2".to_string()),
+                ..Default::default()
+            },
+        ];
+        let stored_parts = vec![
+            PartInfo {
+                part_num: 1,
+                size: short_part_size,
+                etag: Some("etag-1".to_string()),
+                actual_size: short_part_size as i64,
+                ..Default::default()
+            },
+            PartInfo {
+                part_num: 2,
+                size: 15,
+                etag: Some("etag-2".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            complete_multipart_size_for_quota(&uploaded_parts, &stored_parts),
+            Some(short_part_size as u64 + 15)
         );
     }
 
