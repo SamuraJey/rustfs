@@ -17,7 +17,7 @@
 use crate::app::context::{AppContext, get_global_app_context};
 use crate::app::object_usecase::{
     build_put_like_object_lock_metadata, quota_replaced_size_for_write, validate_existing_object_lock_for_write,
-    write_memory_increments_for_write,
+    write_memory_update_for_write,
 };
 use crate::capacity::record_capacity_write;
 use crate::error::ApiError;
@@ -158,15 +158,15 @@ fn complete_multipart_size_for_quota(uploaded_parts: &[CompletePart], stored_par
         }
 
         let stored_part_size = if stored_part.actual_size > 0 {
-            stored_part.actual_size
+            stored_part.actual_size as u64
         } else {
-            stored_part.size as i64
+            stored_part.size as u64
         };
-        if idx < uploaded_parts.len() - 1 && stored_part_size < ABS_MIN_PART_SIZE {
+        if idx < uploaded_parts.len() - 1 && stored_part_size < ABS_MIN_PART_SIZE as u64 {
             return None;
         }
 
-        completed_size = completed_size.saturating_add(stored_part.size as u64);
+        completed_size = completed_size.saturating_add(stored_part_size);
     }
 
     Some(completed_size)
@@ -444,16 +444,30 @@ impl DefaultMultipartUsecase {
 
         let quota_previous_current_size = quota_replaced_size_for_write(&opts, previous_current_info.as_ref());
         if self.bucket_has_quota(&bucket).await {
-            let listed_parts = store
-                .list_object_parts(&bucket, &key, &upload_id, None, MAX_PARTS_COUNT, &ObjectOptions::default())
-                .await
-                .map_err(ApiError::from)?;
-            if !listed_parts.is_truncated
-                && let Some(completed_size) = complete_multipart_size_for_quota(&uploaded_parts, &listed_parts.parts)
-            {
-                self.check_bucket_quota_for_write(&bucket, completed_size, quota_previous_current_size.unwrap_or(0))
-                    .await?;
+            let mut listed_parts = Vec::new();
+            let mut part_number_marker = None;
+            loop {
+                let page = store
+                    .list_object_parts(&bucket, &key, &upload_id, part_number_marker, MAX_PARTS_COUNT, &ObjectOptions::default())
+                    .await
+                    .map_err(ApiError::from)?;
+                let next_part_number_marker = page.next_part_number_marker;
+                let is_truncated = page.is_truncated;
+                listed_parts.extend(page.parts);
+
+                if !is_truncated {
+                    break;
+                }
+                if next_part_number_marker == 0 || Some(next_part_number_marker) == part_number_marker {
+                    return Err(s3_error!(InvalidPart));
+                }
+                part_number_marker = Some(next_part_number_marker);
             }
+
+            let completed_size =
+                complete_multipart_size_for_quota(&uploaded_parts, &listed_parts).ok_or_else(|| s3_error!(InvalidPart))?;
+            self.check_bucket_quota_for_write(&bucket, completed_size, quota_previous_current_size.unwrap_or(0))
+                .await?;
         }
 
         let obj_info = store
@@ -465,14 +479,14 @@ impl DefaultMultipartUsecase {
 
         if self.bucket_metadata_sys().is_some() {
             // Update quota tracking after successful multipart upload
-            let (creates_current_object, creates_version) =
-                write_memory_increments_for_write(&opts, previous_current_info.as_ref());
-            rustfs_ecstore::data_usage::record_bucket_object_write_memory_with_counts(
+            let write_memory_update = write_memory_update_for_write(&opts, previous_current_info.as_ref());
+            rustfs_ecstore::data_usage::record_bucket_object_write_memory_with_deltas(
                 &bucket,
                 quota_previous_current_size,
                 obj_info.size.max(0) as u64,
-                creates_current_object,
-                creates_version,
+                if write_memory_update.creates_current_object { 1 } else { 0 },
+                if write_memory_update.creates_version { 1 } else { 0 },
+                write_memory_update.delete_markers_delta,
             )
             .await;
         }
@@ -1665,7 +1679,7 @@ mod tests {
         let stored_parts = vec![
             PartInfo {
                 part_num: 1,
-                size: ABS_MIN_PART_SIZE as usize,
+                size: ABS_MIN_PART_SIZE as usize + 1024,
                 etag: Some("etag-1".to_string()),
                 actual_size: ABS_MIN_PART_SIZE,
                 ..Default::default()

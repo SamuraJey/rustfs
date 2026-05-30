@@ -1034,21 +1034,55 @@ pub(crate) fn quota_replaced_size_for_write(opts: &ObjectOptions, existing_objec
     Some(existing_object.size.max(0) as u64)
 }
 
-pub(crate) fn write_memory_increments_for_write(opts: &ObjectOptions, existing_object: Option<&ObjectInfo>) -> (bool, bool) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WriteMemoryUpdate {
+    pub(crate) creates_current_object: bool,
+    pub(crate) creates_version: bool,
+    pub(crate) delete_markers_delta: i64,
+}
+
+pub(crate) fn write_memory_update_for_write(opts: &ObjectOptions, existing_object: Option<&ObjectInfo>) -> WriteMemoryUpdate {
     let Some(existing_object) = existing_object else {
-        return (true, true);
+        return WriteMemoryUpdate {
+            creates_current_object: true,
+            creates_version: true,
+            delete_markers_delta: 0,
+        };
     };
     if existing_object.delete_marker {
-        return (true, true);
+        if opts.version_suspended && object_info_is_null_version(existing_object) {
+            return WriteMemoryUpdate {
+                creates_current_object: true,
+                creates_version: true,
+                delete_markers_delta: -1,
+            };
+        }
+        return WriteMemoryUpdate {
+            creates_current_object: true,
+            creates_version: true,
+            delete_markers_delta: 0,
+        };
     }
     if opts.versioned && !opts.version_suspended {
-        return (false, true);
+        return WriteMemoryUpdate {
+            creates_current_object: false,
+            creates_version: true,
+            delete_markers_delta: 0,
+        };
     }
     if opts.version_suspended && existing_object.version_id.is_some_and(|version_id| version_id != Uuid::nil()) {
-        return (false, true);
+        return WriteMemoryUpdate {
+            creates_current_object: false,
+            creates_version: true,
+            delete_markers_delta: 0,
+        };
     }
 
-    (false, false)
+    WriteMemoryUpdate {
+        creates_current_object: false,
+        creates_version: false,
+        delete_markers_delta: 0,
+    }
 }
 
 struct DeleteMemoryDeltas {
@@ -1919,7 +1953,7 @@ impl DefaultObjectUsecase {
         )
         .await?;
 
-        let current_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
+        let current_opts: ObjectOptions = get_opts(&bucket, &key, None, None, &req.headers)
             .await
             .map_err(ApiError::from)?;
         let previous_current_info = match store.get_object_info(&bucket, &key, &current_opts).await {
@@ -2057,13 +2091,14 @@ impl DefaultObjectUsecase {
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        let (creates_current_object, creates_version) = write_memory_increments_for_write(&opts, previous_current_info.as_ref());
-        rustfs_ecstore::data_usage::record_bucket_object_write_memory_with_counts(
+        let write_memory_update = write_memory_update_for_write(&opts, previous_current_info.as_ref());
+        rustfs_ecstore::data_usage::record_bucket_object_write_memory_with_deltas(
             &bucket,
             quota_previous_current_size,
             obj_info.size.max(0) as u64,
-            creates_current_object,
-            creates_version,
+            if write_memory_update.creates_current_object { 1 } else { 0 },
+            if write_memory_update.creates_version { 1 } else { 0 },
+            write_memory_update.delete_markers_delta,
         )
         .await;
 
@@ -2730,7 +2765,6 @@ impl DefaultObjectUsecase {
             copy_source,
             bucket,
             key,
-            version_id: dest_version_id,
             server_side_encryption: requested_sse,
             ssekms_key_id: requested_kms_key_id,
             sse_customer_algorithm,
@@ -2803,7 +2837,7 @@ impl DefaultObjectUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let current_opts: ObjectOptions = get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
+        let current_opts: ObjectOptions = get_opts(&bucket, &key, None, None, &req.headers)
             .await
             .map_err(ApiError::from)?;
         let previous_current_info = match store.get_object_info(&bucket, &key, &current_opts).await {
@@ -2996,14 +3030,14 @@ impl DefaultObjectUsecase {
 
         // Update quota tracking after successful copy
         if has_bucket_metadata {
-            let (creates_current_object, creates_version) =
-                write_memory_increments_for_write(&dst_opts, previous_current_info.as_ref());
-            rustfs_ecstore::data_usage::record_bucket_object_write_memory_with_counts(
+            let write_memory_update = write_memory_update_for_write(&dst_opts, previous_current_info.as_ref());
+            rustfs_ecstore::data_usage::record_bucket_object_write_memory_with_deltas(
                 &bucket,
                 quota_previous_current_size,
                 oi.size.max(0) as u64,
-                creates_current_object,
-                creates_version,
+                if write_memory_update.creates_current_object { 1 } else { 0 },
+                if write_memory_update.creates_version { 1 } else { 0 },
+                write_memory_update.delete_markers_delta,
             )
             .await;
         }
@@ -4456,7 +4490,7 @@ impl DefaultObjectUsecase {
                 size = 0;
             }
 
-            let current_opts = get_opts(&bucket, &fpath, opts.version_id.clone(), None, &req.headers)
+            let current_opts = get_opts(&bucket, &fpath, None, None, &req.headers)
                 .await
                 .map_err(ApiError::from)?;
             let previous_current_info = match store.get_object_info(&bucket, &fpath, &current_opts).await {
@@ -4550,14 +4584,14 @@ impl DefaultObjectUsecase {
                 }
             };
 
-            let (creates_current_object, creates_version) =
-                write_memory_increments_for_write(&opts, previous_current_info.as_ref());
-            rustfs_ecstore::data_usage::record_bucket_object_write_memory_with_counts(
+            let write_memory_update = write_memory_update_for_write(&opts, previous_current_info.as_ref());
+            rustfs_ecstore::data_usage::record_bucket_object_write_memory_with_deltas(
                 &bucket,
                 quota_previous_current_size,
                 obj_info.size.max(0) as u64,
-                creates_current_object,
-                creates_version,
+                if write_memory_update.creates_current_object { 1 } else { 0 },
+                if write_memory_update.creates_version { 1 } else { 0 },
+                write_memory_update.delete_markers_delta,
             )
             .await;
 
@@ -4685,6 +4719,16 @@ mod tests {
             version_id: Some(Uuid::new_v4()),
             ..Default::default()
         };
+        let existing_null_delete_marker = ObjectInfo {
+            version_id: Some(Uuid::nil()),
+            delete_marker: true,
+            ..Default::default()
+        };
+        let existing_delete_marker = ObjectInfo {
+            version_id: Some(Uuid::new_v4()),
+            delete_marker: true,
+            ..Default::default()
+        };
         let unversioned = ObjectOptions::default();
         let enabled = ObjectOptions {
             versioned: true,
@@ -4699,14 +4743,62 @@ mod tests {
         assert_eq!(quota_replaced_size_for_write(&enabled, Some(&existing_version)), None);
         assert_eq!(quota_replaced_size_for_write(&suspended, Some(&existing_null_version)), Some(10));
         assert_eq!(quota_replaced_size_for_write(&suspended, Some(&existing_version)), None);
-        assert_eq!(write_memory_increments_for_write(&unversioned, None), (true, true));
-        assert_eq!(write_memory_increments_for_write(&unversioned, Some(&existing_version)), (false, false));
-        assert_eq!(write_memory_increments_for_write(&enabled, Some(&existing_version)), (false, true));
         assert_eq!(
-            write_memory_increments_for_write(&suspended, Some(&existing_null_version)),
-            (false, false)
+            write_memory_update_for_write(&unversioned, None),
+            WriteMemoryUpdate {
+                creates_current_object: true,
+                creates_version: true,
+                delete_markers_delta: 0,
+            }
         );
-        assert_eq!(write_memory_increments_for_write(&suspended, Some(&existing_version)), (false, true));
+        assert_eq!(
+            write_memory_update_for_write(&unversioned, Some(&existing_version)),
+            WriteMemoryUpdate {
+                creates_current_object: false,
+                creates_version: false,
+                delete_markers_delta: 0,
+            }
+        );
+        assert_eq!(
+            write_memory_update_for_write(&enabled, Some(&existing_version)),
+            WriteMemoryUpdate {
+                creates_current_object: false,
+                creates_version: true,
+                delete_markers_delta: 0,
+            }
+        );
+        assert_eq!(
+            write_memory_update_for_write(&suspended, Some(&existing_null_version)),
+            WriteMemoryUpdate {
+                creates_current_object: false,
+                creates_version: false,
+                delete_markers_delta: 0,
+            }
+        );
+        assert_eq!(
+            write_memory_update_for_write(&suspended, Some(&existing_version)),
+            WriteMemoryUpdate {
+                creates_current_object: false,
+                creates_version: true,
+                delete_markers_delta: 0,
+            }
+        );
+        assert_eq!(
+            write_memory_update_for_write(&suspended, Some(&existing_null_delete_marker)),
+            WriteMemoryUpdate {
+                creates_current_object: true,
+                creates_version: true,
+                delete_markers_delta: -1,
+            }
+        );
+        assert_eq!(
+            write_memory_update_for_write(&enabled, Some(&existing_delete_marker)),
+            WriteMemoryUpdate {
+                creates_current_object: true,
+                creates_version: true,
+                delete_markers_delta: 0,
+            }
+        );
     }
 
     #[test]

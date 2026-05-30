@@ -55,38 +55,77 @@ impl QuotaTestEnv {
     }
 
     pub async fn cleanup_bucket(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let versions = self.client.list_object_versions().bucket(&self.bucket_name).send().await?;
-        for version in versions.versions() {
-            if let (Some(key), Some(version_id)) = (version.key(), version.version_id()) {
-                self.client
-                    .delete_object()
-                    .bucket(&self.bucket_name)
-                    .key(key)
-                    .version_id(version_id)
-                    .send()
-                    .await?;
+        let mut key_marker = None;
+        let mut version_id_marker = None;
+        loop {
+            let mut request = self.client.list_object_versions().bucket(&self.bucket_name);
+            if let Some(marker) = key_marker.take() {
+                request = request.key_marker(marker);
             }
-        }
-        for marker in versions.delete_markers() {
-            if let (Some(key), Some(version_id)) = (marker.key(), marker.version_id()) {
-                self.client
-                    .delete_object()
-                    .bucket(&self.bucket_name)
-                    .key(key)
-                    .version_id(version_id)
-                    .send()
-                    .await?;
+            if let Some(marker) = version_id_marker.take() {
+                request = request.version_id_marker(marker);
+            }
+
+            let versions = request.send().await?;
+            for version in versions.versions() {
+                if let (Some(key), Some(version_id)) = (version.key(), version.version_id()) {
+                    self.client
+                        .delete_object()
+                        .bucket(&self.bucket_name)
+                        .key(key)
+                        .version_id(version_id)
+                        .send()
+                        .await?;
+                }
+            }
+            for marker in versions.delete_markers() {
+                if let (Some(key), Some(version_id)) = (marker.key(), marker.version_id()) {
+                    self.client
+                        .delete_object()
+                        .bucket(&self.bucket_name)
+                        .key(key)
+                        .version_id(version_id)
+                        .send()
+                        .await?;
+                }
+            }
+
+            if versions.is_truncated().unwrap_or(false) {
+                key_marker = versions.next_key_marker().map(str::to_string);
+                version_id_marker = versions.next_version_id_marker().map(str::to_string);
+                if key_marker.is_none() && version_id_marker.is_none() {
+                    return Err("truncated version listing did not return next markers".into());
+                }
+            } else {
+                break;
             }
         }
 
-        let objects = self.client.list_objects_v2().bucket(&self.bucket_name).send().await?;
-        for object in objects.contents() {
-            self.client
-                .delete_object()
-                .bucket(&self.bucket_name)
-                .key(object.key().unwrap_or_default())
-                .send()
-                .await?;
+        let mut continuation_token = None;
+        loop {
+            let mut request = self.client.list_objects_v2().bucket(&self.bucket_name);
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let objects = request.send().await?;
+            for object in objects.contents() {
+                self.client
+                    .delete_object()
+                    .bucket(&self.bucket_name)
+                    .key(object.key().unwrap_or_default())
+                    .send()
+                    .await?;
+            }
+
+            if objects.is_truncated().unwrap_or(false) {
+                continuation_token = objects.next_continuation_token().map(str::to_string);
+                if continuation_token.is_none() {
+                    return Err("truncated object listing did not return a continuation token".into());
+                }
+            } else {
+                break;
+            }
         }
         self.env.delete_test_bucket(&self.bucket_name).await?;
         Ok(())
@@ -221,51 +260,85 @@ impl QuotaTestEnv {
             .key(key)
             .send()
             .await?;
-        let upload_id = create.upload_id().ok_or("missing multipart upload id")?;
+        let upload_id = create.upload_id().ok_or("missing multipart upload id")?.to_string();
 
-        let part = self
-            .client
-            .upload_part()
-            .bucket(&self.bucket_name)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(vec![7u8; size_bytes]))
-            .send()
-            .await?;
-        let completed_part = CompletedPart::builder()
-            .part_number(1)
-            .e_tag(part.e_tag().ok_or("missing multipart etag")?)
-            .build();
+        let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+            let part = self
+                .client
+                .upload_part()
+                .bucket(&self.bucket_name)
+                .key(key)
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from(vec![7u8; size_bytes]))
+                .send()
+                .await?;
+            let completed_part = CompletedPart::builder()
+                .part_number(1)
+                .e_tag(part.e_tag().ok_or("missing multipart etag")?)
+                .build();
 
-        self.client
-            .complete_multipart_upload()
-            .bucket(&self.bucket_name)
-            .key(key)
-            .upload_id(upload_id)
-            .multipart_upload(CompletedMultipartUpload::builder().parts(completed_part).build())
-            .send()
-            .await?;
-        Ok(())
+            self.client
+                .complete_multipart_upload()
+                .bucket(&self.bucket_name)
+                .key(key)
+                .upload_id(&upload_id)
+                .multipart_upload(CompletedMultipartUpload::builder().parts(completed_part).build())
+                .send()
+                .await?;
+            Ok(())
+        }
+        .await;
+
+        if result.is_err() {
+            let _ = self
+                .client
+                .abort_multipart_upload()
+                .bucket(&self.bucket_name)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+        }
+
+        result
     }
 
     pub async fn object_versions_and_markers(
         &self,
         key: &str,
     ) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
-        let listed = self
-            .client
-            .list_object_versions()
-            .bucket(&self.bucket_name)
-            .prefix(key)
-            .send()
-            .await?;
-        let versions = listed.versions().iter().filter(|version| version.key() == Some(key)).count();
-        let markers = listed
-            .delete_markers()
-            .iter()
-            .filter(|marker| marker.key() == Some(key))
-            .count();
+        let mut versions = 0;
+        let mut markers = 0;
+        let mut key_marker = None;
+        let mut version_id_marker = None;
+        loop {
+            let mut request = self.client.list_object_versions().bucket(&self.bucket_name).prefix(key);
+            if let Some(marker) = key_marker.take() {
+                request = request.key_marker(marker);
+            }
+            if let Some(marker) = version_id_marker.take() {
+                request = request.version_id_marker(marker);
+            }
+
+            let listed = request.send().await?;
+            versions += listed.versions().iter().filter(|version| version.key() == Some(key)).count();
+            markers += listed
+                .delete_markers()
+                .iter()
+                .filter(|marker| marker.key() == Some(key))
+                .count();
+
+            if listed.is_truncated().unwrap_or(false) {
+                key_marker = listed.next_key_marker().map(str::to_string);
+                version_id_marker = listed.next_version_id_marker().map(str::to_string);
+                if key_marker.is_none() && version_id_marker.is_none() {
+                    return Err("truncated version listing did not return next markers".into());
+                }
+            } else {
+                break;
+            }
+        }
         Ok((versions, markers))
     }
 
