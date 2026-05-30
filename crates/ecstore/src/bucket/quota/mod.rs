@@ -80,6 +80,18 @@ impl BucketQuota {
         }
     }
 
+    pub fn projected_write_usage(current_usage: u64, replaced_size: u64, new_size: u64) -> u64 {
+        current_usage.saturating_sub(replaced_size).saturating_add(new_size)
+    }
+
+    pub fn check_write_allowed(&self, current_usage: u64, replaced_size: u64, new_size: u64) -> bool {
+        if let Some(quota_limit) = self.quota {
+            Self::projected_write_usage(current_usage, replaced_size, new_size) <= quota_limit
+        } else {
+            true // No quota limit
+        }
+    }
+
     pub fn get_remaining_quota(&self, current_usage: u64) -> Option<u64> {
         self.quota.map(|limit| limit.saturating_sub(current_usage))
     }
@@ -216,5 +228,14 @@ mod tests {
         let q = BucketQuota::unmarshal(json.as_bytes()).expect("should parse");
         assert_eq!(q.quota, Some(1073741824));
         assert_eq!(q.quota_type, QuotaType::Hard);
+    }
+
+    #[test]
+    fn check_write_allowed_accounts_for_replaced_size() {
+        let quota = BucketQuota::new(Some(1024));
+
+        assert!(quota.check_write_allowed(1024, 512, 512));
+        assert!(quota.check_write_allowed(1024, 768, 256));
+        assert!(!quota.check_write_allowed(1024, 256, 512));
     }
 }

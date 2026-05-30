@@ -14,6 +14,8 @@
 
 use crate::common::{RustFSTestEnvironment, awscurl_delete, awscurl_get, awscurl_post, awscurl_put, init_logging};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
 use serial_test::serial;
 use tracing::{debug, info};
 
@@ -53,6 +55,30 @@ impl QuotaTestEnv {
     }
 
     pub async fn cleanup_bucket(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let versions = self.client.list_object_versions().bucket(&self.bucket_name).send().await?;
+        for version in versions.versions() {
+            if let (Some(key), Some(version_id)) = (version.key(), version.version_id()) {
+                self.client
+                    .delete_object()
+                    .bucket(&self.bucket_name)
+                    .key(key)
+                    .version_id(version_id)
+                    .send()
+                    .await?;
+            }
+        }
+        for marker in versions.delete_markers() {
+            if let (Some(key), Some(version_id)) = (marker.key(), marker.version_id()) {
+                self.client
+                    .delete_object()
+                    .bucket(&self.bucket_name)
+                    .key(key)
+                    .version_id(version_id)
+                    .send()
+                    .await?;
+            }
+        }
+
         let objects = self.client.list_objects_v2().bucket(&self.bucket_name).send().await?;
         for object in objects.contents() {
             self.client
@@ -171,6 +197,76 @@ impl QuotaTestEnv {
     pub async fn get_bucket_usage(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let stats = self.get_bucket_quota_stats().await?;
         Ok(stats.get("current_usage").and_then(|v| v.as_u64()).unwrap_or(0))
+    }
+
+    pub async fn enable_versioning(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.client
+            .put_bucket_versioning()
+            .bucket(&self.bucket_name)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn multipart_upload(&self, key: &str, size_bytes: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let create = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket_name)
+            .key(key)
+            .send()
+            .await?;
+        let upload_id = create.upload_id().ok_or("missing multipart upload id")?;
+
+        let part = self
+            .client
+            .upload_part()
+            .bucket(&self.bucket_name)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(vec![7u8; size_bytes]))
+            .send()
+            .await?;
+        let completed_part = CompletedPart::builder()
+            .part_number(1)
+            .e_tag(part.e_tag().ok_or("missing multipart etag")?)
+            .build();
+
+        self.client
+            .complete_multipart_upload()
+            .bucket(&self.bucket_name)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(CompletedMultipartUpload::builder().parts(completed_part).build())
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn object_versions_and_markers(
+        &self,
+        key: &str,
+    ) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
+        let listed = self
+            .client
+            .list_object_versions()
+            .bucket(&self.bucket_name)
+            .prefix(key)
+            .send()
+            .await?;
+        let versions = listed.versions().iter().filter(|version| version.key() == Some(key)).count();
+        let markers = listed
+            .delete_markers()
+            .iter()
+            .filter(|marker| marker.key() == Some(key))
+            .count();
+        Ok((versions, markers))
     }
 
     pub async fn set_bucket_quota_for(
@@ -762,6 +858,35 @@ mod integration_tests {
         // Now should be able to upload again (quota freed up)
         env.upload_object("file3.txt", 256 * 1024).await?;
         assert!(env.object_exists("file3.txt").await?);
+
+        env.cleanup_bucket().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_quota_multipart_upload_with_versioning_removes_rejected_version()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        init_logging();
+        if skip_without_awscurl() {
+            return Ok(());
+        }
+        let env = QuotaTestEnv::new().await?;
+
+        env.create_bucket().await?;
+        env.enable_versioning().await?;
+        env.set_bucket_quota(1024 * 1024).await?;
+
+        let key = "versioned-over-quota-multipart.bin";
+        let upload_result = env.multipart_upload(key, 2 * 1024 * 1024).await;
+
+        assert!(upload_result.is_err(), "multipart upload larger than quota must fail");
+        assert!(!env.object_exists(key).await?, "rejected object must not be current");
+        let (versions, markers) = env.object_versions_and_markers(key).await?;
+        assert_eq!(versions, 0, "rejected multipart upload must not leave an object version");
+        assert_eq!(markers, 0, "quota cleanup must not create a delete marker");
+        assert_eq!(env.get_bucket_usage().await?, 0, "quota usage must remain unchanged");
 
         env.cleanup_bucket().await?;
 

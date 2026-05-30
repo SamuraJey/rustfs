@@ -41,6 +41,74 @@ impl QuotaChecker {
             .await
     }
 
+    pub async fn check_quota_for_write(
+        &self,
+        bucket: &str,
+        operation: QuotaOperation,
+        new_size: u64,
+        replaced_size: u64,
+    ) -> Result<QuotaCheckResult, QuotaError> {
+        let start_time = Instant::now();
+        let quota_config = self.get_quota_config(bucket).await?;
+
+        let quota_limit = match quota_config.quota {
+            None => {
+                return Ok(QuotaCheckResult {
+                    allowed: true,
+                    current_usage: None,
+                    quota_limit: None,
+                    operation_size: new_size,
+                    remaining: None,
+                });
+            }
+            Some(q) => q,
+        };
+
+        let current_usage = self.get_real_time_usage(bucket).await?;
+        let expected_usage = match operation {
+            QuotaOperation::PutObject | QuotaOperation::PostObject | QuotaOperation::CopyObject => {
+                BucketQuota::projected_write_usage(current_usage, replaced_size, new_size)
+            }
+            QuotaOperation::DeleteObject => current_usage.saturating_sub(new_size),
+        };
+
+        let allowed = match operation {
+            QuotaOperation::PutObject | QuotaOperation::PostObject | QuotaOperation::CopyObject => {
+                quota_config.check_write_allowed(current_usage, replaced_size, new_size)
+            }
+            QuotaOperation::DeleteObject => true,
+        };
+
+        let remaining = if quota_limit >= expected_usage {
+            Some(quota_limit - expected_usage)
+        } else {
+            Some(0)
+        };
+
+        if !allowed {
+            warn!(
+                "Quota exceeded for bucket: {}, current: {}, limit: {}, attempted: {}",
+                bucket, current_usage, quota_limit, new_size
+            );
+        }
+
+        let result = QuotaCheckResult {
+            allowed,
+            current_usage: Some(current_usage),
+            quota_limit: Some(quota_limit),
+            operation_size: new_size,
+            remaining,
+        };
+
+        let duration = start_time.elapsed();
+        rustfs_common::metrics::Metrics::inc_time(Metric::QuotaCheck, duration);
+        if !allowed {
+            rustfs_common::metrics::Metrics::inc_time(Metric::QuotaViolation, duration);
+        }
+
+        Ok(result)
+    }
+
     /// Check quota with option to force usage calculation even when no quota is configured
     pub async fn check_quota_with_usage_reporting(
         &self,
@@ -74,7 +142,9 @@ impl QuotaChecker {
         let current_usage = self.get_real_time_usage(bucket).await?;
 
         let expected_usage = match operation {
-            QuotaOperation::PutObject | QuotaOperation::PostObject | QuotaOperation::CopyObject => current_usage + operation_size,
+            QuotaOperation::PutObject | QuotaOperation::PostObject | QuotaOperation::CopyObject => {
+                current_usage.saturating_add(operation_size)
+            }
             QuotaOperation::DeleteObject => current_usage.saturating_sub(operation_size),
         };
 

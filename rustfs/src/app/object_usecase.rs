@@ -1014,6 +1014,111 @@ fn delete_creates_delete_marker(opts: &ObjectOptions) -> bool {
     opts.version_id.is_none() && opts.versioned && !opts.version_suspended
 }
 
+fn object_info_is_null_version(info: &ObjectInfo) -> bool {
+    info.version_id.is_none_or(|version_id| version_id == Uuid::nil())
+}
+
+fn normalized_null_version_id(version_id: Option<Uuid>) -> Option<Uuid> {
+    version_id.filter(|version_id| *version_id != Uuid::nil())
+}
+
+pub(crate) fn quota_replaced_size_for_write(opts: &ObjectOptions, existing_object: Option<&ObjectInfo>) -> Option<u64> {
+    let existing_object = existing_object?;
+    if opts.versioned && !opts.version_suspended {
+        return None;
+    }
+    if opts.version_suspended && existing_object.version_id.is_some_and(|version_id| version_id != Uuid::nil()) {
+        return None;
+    }
+
+    Some(existing_object.size.max(0) as u64)
+}
+
+pub(crate) fn write_memory_increments_for_write(opts: &ObjectOptions, existing_object: Option<&ObjectInfo>) -> (bool, bool) {
+    let Some(existing_object) = existing_object else {
+        return (true, true);
+    };
+    if existing_object.delete_marker {
+        return (true, true);
+    }
+    if opts.versioned && !opts.version_suspended {
+        return (false, true);
+    }
+    if opts.version_suspended && existing_object.version_id.is_some_and(|version_id| version_id != Uuid::nil()) {
+        return (false, true);
+    }
+
+    (false, false)
+}
+
+struct DeleteMemoryDeltas {
+    deleted_size: u64,
+    current_objects_delta: i64,
+    versions_delta: i64,
+    delete_markers_delta: i64,
+}
+
+fn delete_memory_deltas_for_result(
+    opts: &ObjectOptions,
+    existing_object: Option<&ObjectInfo>,
+    result_delete_marker: bool,
+    result_delete_marker_version_id: Option<Uuid>,
+    after_current_object: Option<&ObjectInfo>,
+) -> DeleteMemoryDeltas {
+    let removes_object_version = existing_object.is_some_and(|info| {
+        if info.delete_marker {
+            return false;
+        }
+        if opts.version_id.is_some() {
+            return true;
+        }
+        if opts.version_suspended && result_delete_marker && object_info_is_null_version(info) {
+            return true;
+        }
+
+        !result_delete_marker
+    });
+
+    let creates_delete_marker = result_delete_marker
+        && opts.version_id.is_none()
+        && !existing_object.is_some_and(|info| {
+            info.delete_marker
+                && normalized_null_version_id(info.version_id) == normalized_null_version_id(result_delete_marker_version_id)
+        });
+    let removes_delete_marker = opts.version_id.is_some() && existing_object.is_some_and(|info| info.delete_marker);
+
+    let before_current_visible = existing_object.is_some_and(|info| {
+        if opts.version_id.is_some() {
+            info.is_latest && !info.delete_marker
+        } else {
+            !info.delete_marker
+        }
+    });
+    let after_current_visible = if opts.version_id.is_some() && existing_object.is_some_and(|info| info.is_latest) {
+        after_current_object.is_some_and(|info| !info.delete_marker)
+    } else if opts.version_id.is_some() {
+        before_current_visible
+    } else {
+        false
+    };
+    let current_objects_delta = match (before_current_visible, after_current_visible) {
+        (true, false) => -1,
+        (false, true) => 1,
+        _ => 0,
+    };
+
+    DeleteMemoryDeltas {
+        deleted_size: if removes_object_version {
+            existing_object.map(|info| info.size.max(0) as u64).unwrap_or(0)
+        } else {
+            0
+        },
+        current_objects_delta,
+        versions_delta: if removes_object_version { -1 } else { 0 },
+        delete_markers_delta: (if creates_delete_marker { 1 } else { 0 }) - (if removes_delete_marker { 1 } else { 0 }),
+    }
+}
+
 fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObjectExtractOptions> {
     let prefix = snowball_meta_value(headers, SNOWBALL_PREFIX_HEADER_KEYS, SNOWBALL_PREFIX_SUFFIX_LOWER)
         .map(|value| normalize_snowball_prefix(&value))
@@ -1090,12 +1195,18 @@ impl DefaultObjectUsecase {
             .unwrap_or_else(|| RustFSBufferConfig::default().base_config.default_unknown)
     }
 
-    async fn check_bucket_quota(&self, bucket: &str, op: QuotaOperation, size: u64) -> S3Result<()> {
+    async fn check_bucket_quota_for_write(
+        &self,
+        bucket: &str,
+        op: QuotaOperation,
+        new_size: u64,
+        replaced_size: u64,
+    ) -> S3Result<()> {
         let Some(metadata_sys) = self.bucket_metadata_sys() else {
             return Ok(());
         };
         let quota_checker = QuotaChecker::new(metadata_sys);
-        match quota_checker.check_quota(bucket, op, size).await {
+        match quota_checker.check_quota_for_write(bucket, op, new_size, replaced_size).await {
             Ok(result) if !result.allowed => Err(S3Error::with_message(
                 S3ErrorCode::InvalidRequest,
                 format!(
@@ -1691,10 +1802,6 @@ impl DefaultObjectUsecase {
         // Validate object key
         validate_object_key(&key, request_method_name)?;
 
-        if let Some(size) = content_length {
-            self.check_bucket_quota(&bucket, quota_operation, size as u64).await?;
-        }
-
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
         let mut size = match content_length {
@@ -1815,10 +1922,10 @@ impl DefaultObjectUsecase {
         let current_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
+        let previous_current_info = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
                 validate_existing_object_lock_for_write(&existing_obj_info)?;
-                Some(existing_obj_info.size.max(0) as u64)
+                Some(existing_obj_info)
             }
             Err(err) => {
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
@@ -1827,8 +1934,16 @@ impl DefaultObjectUsecase {
                 None
             }
         };
+        let quota_previous_current_size = quota_replaced_size_for_write(&opts, previous_current_info.as_ref());
 
         let actual_size = size;
+        self.check_bucket_quota_for_write(
+            &bucket,
+            quota_operation,
+            actual_size.max(0) as u64,
+            quota_previous_current_size.unwrap_or(0),
+        )
+        .await?;
 
         let mut md5hex = if let Some(base64_md5) = content_md5 {
             let md5 = base64_simd::STANDARD
@@ -1942,10 +2057,13 @@ impl DefaultObjectUsecase {
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        rustfs_ecstore::data_usage::record_bucket_object_write_memory(
+        let (creates_current_object, creates_version) = write_memory_increments_for_write(&opts, previous_current_info.as_ref());
+        rustfs_ecstore::data_usage::record_bucket_object_write_memory_with_counts(
             &bucket,
-            previous_current_size,
+            quota_previous_current_size,
             obj_info.size.max(0) as u64,
+            creates_current_object,
+            creates_version,
         )
         .await;
 
@@ -2688,10 +2806,10 @@ impl DefaultObjectUsecase {
         let current_opts: ObjectOptions = get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
+        let previous_current_info = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
                 validate_existing_object_lock_for_write(&existing_obj_info)?;
-                Some(existing_obj_info.size.max(0) as u64)
+                Some(existing_obj_info)
             }
             Err(err) => {
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
@@ -2859,8 +2977,14 @@ impl DefaultObjectUsecase {
             src_info.user_defined.insert(k, v);
         }
 
-        self.check_bucket_quota(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
-            .await?;
+        let quota_previous_current_size = quota_replaced_size_for_write(&dst_opts, previous_current_info.as_ref());
+        self.check_bucket_quota_for_write(
+            &bucket,
+            QuotaOperation::CopyObject,
+            src_info.size.max(0) as u64,
+            quota_previous_current_size.unwrap_or(0),
+        )
+        .await?;
         let has_bucket_metadata = self.bucket_metadata_sys().is_some();
 
         let oi = store
@@ -2872,8 +2996,16 @@ impl DefaultObjectUsecase {
 
         // Update quota tracking after successful copy
         if has_bucket_metadata {
-            rustfs_ecstore::data_usage::record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64)
-                .await;
+            let (creates_current_object, creates_version) =
+                write_memory_increments_for_write(&dst_opts, previous_current_info.as_ref());
+            rustfs_ecstore::data_usage::record_bucket_object_write_memory_with_counts(
+                &bucket,
+                quota_previous_current_size,
+                oi.size.max(0) as u64,
+                creates_current_object,
+                creates_version,
+            )
+            .await;
         }
 
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
@@ -2962,7 +3094,6 @@ impl DefaultObjectUsecase {
 
         let mut object_to_delete = Vec::new();
         let mut object_to_delete_idx = Vec::new();
-        let mut object_sizes = Vec::new();
         let mut existing_object_infos = Vec::new();
         for (idx, obj_id) in delete.objects.iter().enumerate() {
             let raw_version_id = obj_id.version_id.clone();
@@ -3044,8 +3175,6 @@ impl DefaultObjectUsecase {
                 });
                 continue;
             }
-
-            object_sizes.push(goi.size);
 
             if is_dir_object(&object.object_name) && object.version_id.is_none() {
                 object.version_id = Some(Uuid::nil());
@@ -3129,11 +3258,49 @@ impl DefaultObjectUsecase {
                     existing_object_infos[i].as_ref(),
                 )
                 .await;
-                let size = object_sizes[i].max(0) as u64;
-                rustfs_ecstore::data_usage::record_bucket_object_delete_memory(
+                let accounting_opts = ObjectOptions {
+                    version_id: object_to_delete[i].version_id.map(|version_id| version_id.to_string()),
+                    versioned: version_cfg.prefix_enabled(object_to_delete[i].object_name.as_str()),
+                    version_suspended: version_cfg.suspended(),
+                    ..Default::default()
+                };
+                let after_current_info = if accounting_opts.version_id.is_some()
+                    && existing_object_infos[i].as_ref().is_some_and(|info| info.is_latest)
+                {
+                    match get_opts(&bucket, &object_to_delete[i].object_name, None, None, &req.headers).await {
+                        Ok(current_opts) => match store
+                            .get_object_info(&bucket, &object_to_delete[i].object_name, &current_opts)
+                            .await
+                        {
+                            Ok(info) => Some(info),
+                            Err(err) => {
+                                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                                    warn!("Post-delete object info lookup failed for bucket {bucket}: {err}");
+                                }
+                                None
+                            }
+                        },
+                        Err(err) => {
+                            warn!("Post-delete object options lookup failed for bucket {bucket}: {err}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let deltas = delete_memory_deltas_for_result(
+                    &accounting_opts,
+                    existing_object_infos[i].as_ref(),
+                    dobjs[i].delete_marker,
+                    dobjs[i].delete_marker_version_id,
+                    after_current_info.as_ref(),
+                );
+                rustfs_ecstore::data_usage::record_bucket_object_delete_memory_with_deltas(
                     &bucket,
-                    size,
-                    existing_object_infos[i].is_some() && object_to_delete[i].version_id.is_none(),
+                    deltas.deleted_size,
+                    deltas.current_objects_delta,
+                    deltas.versions_delta,
+                    deltas.delete_markers_delta,
                 )
                 .await;
                 continue;
@@ -3351,10 +3518,39 @@ impl DefaultObjectUsecase {
         enqueue_transitioned_delete_cleanup(&bucket, &key, &opts, existing_object_info.as_ref()).await;
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        rustfs_ecstore::data_usage::record_bucket_object_delete_memory(
+        let after_current_info = if opts.version_id.is_some() && existing_object_info.as_ref().is_some_and(|info| info.is_latest)
+        {
+            match crate::storage::options::get_opts(&bucket, &key, None, None, &req.headers).await {
+                Ok(current_opts) => match store.get_object_info(&bucket, &key, &current_opts).await {
+                    Ok(info) => Some(info),
+                    Err(err) => {
+                        if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                            warn!("Post-delete object info lookup failed for bucket {bucket}: {err}");
+                        }
+                        None
+                    }
+                },
+                Err(err) => {
+                    warn!("Post-delete object options lookup failed for bucket {bucket}: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let deltas = delete_memory_deltas_for_result(
+            &opts,
+            existing_object_info.as_ref(),
+            obj_info.delete_marker,
+            obj_info.version_id,
+            after_current_info.as_ref(),
+        );
+        rustfs_ecstore::data_usage::record_bucket_object_delete_memory_with_deltas(
             &bucket,
-            obj_info.size.max(0) as u64,
-            opts.version_id.is_none(),
+            deltas.deleted_size,
+            deltas.current_objects_delta,
+            deltas.versions_delta,
+            deltas.delete_markers_delta,
         )
         .await;
 
@@ -4095,8 +4291,6 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(UnexpectedContent));
         }
         validate_object_key(&key, "PUT")?;
-        self.check_bucket_quota(&bucket, QuotaOperation::PutObject, size as u64)
-            .await?;
 
         // Apply adaptive buffer sizing based on file size for optimal streaming performance.
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
@@ -4262,7 +4456,31 @@ impl DefaultObjectUsecase {
                 size = 0;
             }
 
+            let current_opts = get_opts(&bucket, &fpath, opts.version_id.clone(), None, &req.headers)
+                .await
+                .map_err(ApiError::from)?;
+            let previous_current_info = match store.get_object_info(&bucket, &fpath, &current_opts).await {
+                Ok(existing_obj_info) => {
+                    validate_existing_object_lock_for_write(&existing_obj_info)?;
+                    Some(existing_obj_info)
+                }
+                Err(err) => {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                        return Err(ApiError::from(err).into());
+                    }
+                    None
+                }
+            };
+            let quota_previous_current_size = quota_replaced_size_for_write(&opts, previous_current_info.as_ref());
+
             let actual_size = size;
+            self.check_bucket_quota_for_write(
+                &bucket,
+                QuotaOperation::PutObject,
+                actual_size.max(0) as u64,
+                quota_previous_current_size.unwrap_or(0),
+            )
+            .await?;
 
             let should_compress = !is_dir && is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64;
 
@@ -4331,6 +4549,17 @@ impl DefaultObjectUsecase {
                     return Err(ApiError::from(e).into());
                 }
             };
+
+            let (creates_current_object, creates_version) =
+                write_memory_increments_for_write(&opts, previous_current_info.as_ref());
+            rustfs_ecstore::data_usage::record_bucket_object_write_memory_with_counts(
+                &bucket,
+                quota_previous_current_size,
+                obj_info.size.max(0) as u64,
+                creates_current_object,
+                creates_version,
+            )
+            .await;
 
             let _manager = get_concurrency_manager();
             let _fpath_clone = fpath.clone();
@@ -4442,6 +4671,108 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    #[test]
+    fn quota_replaced_size_for_write_handles_versioning_states() {
+        let existing_null_version = ObjectInfo {
+            size: 10,
+            version_id: Some(Uuid::nil()),
+            ..Default::default()
+        };
+        let existing_version = ObjectInfo {
+            size: 10,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let unversioned = ObjectOptions::default();
+        let enabled = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        let suspended = ObjectOptions {
+            version_suspended: true,
+            ..Default::default()
+        };
+
+        assert_eq!(quota_replaced_size_for_write(&unversioned, Some(&existing_version)), Some(10));
+        assert_eq!(quota_replaced_size_for_write(&enabled, Some(&existing_version)), None);
+        assert_eq!(quota_replaced_size_for_write(&suspended, Some(&existing_null_version)), Some(10));
+        assert_eq!(quota_replaced_size_for_write(&suspended, Some(&existing_version)), None);
+        assert_eq!(write_memory_increments_for_write(&unversioned, None), (true, true));
+        assert_eq!(write_memory_increments_for_write(&unversioned, Some(&existing_version)), (false, false));
+        assert_eq!(write_memory_increments_for_write(&enabled, Some(&existing_version)), (false, true));
+        assert_eq!(
+            write_memory_increments_for_write(&suspended, Some(&existing_null_version)),
+            (false, false)
+        );
+        assert_eq!(write_memory_increments_for_write(&suspended, Some(&existing_version)), (false, true));
+    }
+
+    #[test]
+    fn delete_memory_deltas_handle_versioning_states() {
+        let existing_null_version = ObjectInfo {
+            size: 10,
+            version_id: Some(Uuid::nil()),
+            is_latest: true,
+            ..Default::default()
+        };
+        let existing_version = ObjectInfo {
+            size: 10,
+            version_id: Some(Uuid::new_v4()),
+            is_latest: true,
+            ..Default::default()
+        };
+        let existing_delete_marker = ObjectInfo {
+            version_id: Some(Uuid::new_v4()),
+            delete_marker: true,
+            is_latest: true,
+            ..Default::default()
+        };
+
+        let enabled = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        let suspended = ObjectOptions {
+            version_suspended: true,
+            ..Default::default()
+        };
+
+        let enabled_marker = delete_memory_deltas_for_result(&enabled, Some(&existing_version), true, Some(Uuid::new_v4()), None);
+        assert_eq!(enabled_marker.deleted_size, 0);
+        assert_eq!(enabled_marker.current_objects_delta, -1);
+        assert_eq!(enabled_marker.versions_delta, 0);
+        assert_eq!(enabled_marker.delete_markers_delta, 1);
+
+        let suspended_null_marker = delete_memory_deltas_for_result(&suspended, Some(&existing_null_version), true, None, None);
+        assert_eq!(suspended_null_marker.deleted_size, 10);
+        assert_eq!(suspended_null_marker.current_objects_delta, -1);
+        assert_eq!(suspended_null_marker.versions_delta, -1);
+        assert_eq!(suspended_null_marker.delete_markers_delta, 1);
+
+        let delete_marker_version = ObjectOptions {
+            versioned: true,
+            version_id: existing_delete_marker.version_id.map(|version_id| version_id.to_string()),
+            ..Default::default()
+        };
+        let exposed_current = ObjectInfo {
+            size: 10,
+            version_id: Some(Uuid::new_v4()),
+            is_latest: true,
+            ..Default::default()
+        };
+        let marker_removal = delete_memory_deltas_for_result(
+            &delete_marker_version,
+            Some(&existing_delete_marker),
+            true,
+            existing_delete_marker.version_id,
+            Some(&exposed_current),
+        );
+        assert_eq!(marker_removal.deleted_size, 0);
+        assert_eq!(marker_removal.current_objects_delta, 1);
+        assert_eq!(marker_removal.versions_delta, 0);
+        assert_eq!(marker_removal.delete_markers_delta, -1);
     }
 
     #[tokio::test]

@@ -443,6 +443,25 @@ fn data_usage_info_updated_at(data_usage_info: &DataUsageInfo) -> SystemTime {
 
 /// Fast in-memory update for immediate quota and admin usage consistency.
 pub async fn record_bucket_object_write_memory(bucket: &str, previous_current_size: Option<u64>, new_size: u64) {
+    let creates_current_object = previous_current_size.is_none();
+    record_bucket_object_write_memory_with_counts(
+        bucket,
+        previous_current_size,
+        new_size,
+        creates_current_object,
+        creates_current_object,
+    )
+    .await;
+}
+
+/// Fast in-memory update for immediate quota and admin usage consistency.
+pub async fn record_bucket_object_write_memory_with_counts(
+    bucket: &str,
+    previous_current_size: Option<u64>,
+    new_size: u64,
+    creates_current_object: bool,
+    creates_version: bool,
+) {
     ensure_bucket_usage_cached(bucket).await;
 
     let mut cache = memory_cache().write().await;
@@ -456,9 +475,14 @@ pub async fn record_bucket_object_write_memory(bucket: &str, previous_current_si
         }
         None => {
             entry.usage.size = entry.usage.size.saturating_add(new_size);
-            entry.usage.objects_count = entry.usage.objects_count.saturating_add(1);
-            entry.usage.versions_count = entry.usage.versions_count.saturating_add(1);
         }
+    }
+
+    if creates_current_object {
+        entry.usage.objects_count = entry.usage.objects_count.saturating_add(1);
+    }
+    if creates_version {
+        entry.usage.versions_count = entry.usage.versions_count.saturating_add(1);
     }
 
     let now = SystemTime::now();
@@ -473,6 +497,36 @@ pub async fn increment_bucket_usage_memory(bucket: &str, size_increment: u64) {
 
 /// Fast in-memory update for successful object deletes.
 pub async fn record_bucket_object_delete_memory(bucket: &str, deleted_size: u64, removed_current_object: bool) {
+    record_bucket_object_delete_memory_with_counts(bucket, deleted_size, removed_current_object, removed_current_object, false)
+        .await;
+}
+
+/// Fast in-memory update for successful object deletes.
+pub async fn record_bucket_object_delete_memory_with_counts(
+    bucket: &str,
+    deleted_size: u64,
+    removed_current_object: bool,
+    removed_version: bool,
+    created_delete_marker: bool,
+) {
+    record_bucket_object_delete_memory_with_deltas(
+        bucket,
+        deleted_size,
+        if removed_current_object { -1 } else { 0 },
+        if removed_version { -1 } else { 0 },
+        if created_delete_marker { 1 } else { 0 },
+    )
+    .await;
+}
+
+/// Fast in-memory update for successful object deletes.
+pub async fn record_bucket_object_delete_memory_with_deltas(
+    bucket: &str,
+    deleted_size: u64,
+    current_objects_delta: i64,
+    versions_delta: i64,
+    delete_markers_delta: i64,
+) {
     ensure_bucket_usage_cached(bucket).await;
 
     let mut cache = memory_cache().write().await;
@@ -481,14 +535,21 @@ pub async fn record_bucket_object_delete_memory(bucket: &str, deleted_size: u64,
         .or_insert_with(|| cached_bucket_usage_now(BucketUsageInfo::default()));
 
     entry.usage.size = entry.usage.size.saturating_sub(deleted_size);
-    if removed_current_object {
-        entry.usage.objects_count = entry.usage.objects_count.saturating_sub(1);
-        entry.usage.versions_count = entry.usage.versions_count.saturating_sub(1);
-    }
+    apply_count_delta(&mut entry.usage.objects_count, current_objects_delta);
+    apply_count_delta(&mut entry.usage.versions_count, versions_delta);
+    apply_count_delta(&mut entry.usage.delete_markers_count, delete_markers_delta);
 
     let now = SystemTime::now();
     entry.refreshed_at = now;
     entry.usage_updated_at = now;
+}
+
+fn apply_count_delta(value: &mut u64, delta: i64) {
+    if delta >= 0 {
+        *value = value.saturating_add(delta as u64);
+    } else {
+        *value = value.saturating_sub(delta.unsigned_abs());
+    }
 }
 
 /// Fast in-memory decrement for immediate quota consistency
@@ -973,6 +1034,111 @@ mod tests {
                 .get("bucket-a")
                 .map(|usage| (usage.objects_count, usage.size)),
             Some((1, 20))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn memory_overlay_preserves_object_count_for_versioned_overwrite() {
+        clear_usage_memory_cache_for_test().await;
+
+        let persisted = data_usage_info_for_test("bucket-a", 1, 10, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&persisted).await;
+        record_bucket_object_write_memory_with_counts("bucket-a", None, 20, false, true).await;
+
+        let mut response = persisted.clone();
+        apply_bucket_usage_memory_overlay(&mut response).await;
+
+        assert_eq!(response.objects_total_count, 1);
+        assert_eq!(response.versions_total_count, 2);
+        assert_eq!(response.objects_total_size, 30);
+        assert_eq!(
+            response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| (usage.objects_count, usage.versions_count, usage.size)),
+            Some((1, 2, 30))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn memory_overlay_accounts_for_delete_marker_creation() {
+        clear_usage_memory_cache_for_test().await;
+
+        let persisted = data_usage_info_for_test("bucket-a", 1, 42, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&persisted).await;
+        record_bucket_object_delete_memory_with_counts("bucket-a", 0, true, false, true).await;
+
+        let mut response = persisted.clone();
+        apply_bucket_usage_memory_overlay(&mut response).await;
+
+        assert_eq!(response.objects_total_count, 0);
+        assert_eq!(response.versions_total_count, 1);
+        assert_eq!(response.delete_markers_total_count, 1);
+        assert_eq!(response.objects_total_size, 42);
+        assert_eq!(
+            response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| { (usage.objects_count, usage.versions_count, usage.delete_markers_count, usage.size,) }),
+            Some((0, 1, 1, 42))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn memory_overlay_accounts_for_suspended_null_version_delete() {
+        clear_usage_memory_cache_for_test().await;
+
+        let persisted = data_usage_info_for_test("bucket-a", 1, 42, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&persisted).await;
+        record_bucket_object_delete_memory_with_deltas("bucket-a", 42, -1, -1, 1).await;
+
+        let mut response = persisted.clone();
+        apply_bucket_usage_memory_overlay(&mut response).await;
+
+        assert_eq!(response.objects_total_count, 0);
+        assert_eq!(response.versions_total_count, 0);
+        assert_eq!(response.delete_markers_total_count, 1);
+        assert_eq!(response.objects_total_size, 0);
+        assert_eq!(
+            response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| { (usage.objects_count, usage.versions_count, usage.delete_markers_count, usage.size,) }),
+            Some((0, 0, 1, 0))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn memory_overlay_accounts_for_delete_marker_version_removal() {
+        clear_usage_memory_cache_for_test().await;
+
+        let mut persisted = data_usage_info_for_test("bucket-a", 0, 42, SystemTime::now() - Duration::from_secs(10));
+        if let Some(usage) = persisted.buckets_usage.get_mut("bucket-a") {
+            usage.versions_count = 1;
+            usage.delete_markers_count = 1;
+        }
+        persisted.versions_total_count = 1;
+        persisted.delete_markers_total_count = 1;
+        replace_bucket_usage_memory_from_info(&persisted).await;
+        record_bucket_object_delete_memory_with_deltas("bucket-a", 0, 1, 0, -1).await;
+
+        let mut response = persisted.clone();
+        apply_bucket_usage_memory_overlay(&mut response).await;
+
+        assert_eq!(response.objects_total_count, 1);
+        assert_eq!(response.versions_total_count, 1);
+        assert_eq!(response.delete_markers_total_count, 0);
+        assert_eq!(response.objects_total_size, 42);
+        assert_eq!(
+            response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| { (usage.objects_count, usage.versions_count, usage.delete_markers_count, usage.size,) }),
+            Some((1, 1, 0, 42))
         );
     }
 
