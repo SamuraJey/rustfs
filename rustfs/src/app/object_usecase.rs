@@ -1034,6 +1034,16 @@ pub(crate) fn quota_replaced_size_for_write(opts: &ObjectOptions, existing_objec
     Some(existing_object.size.max(0) as u64)
 }
 
+fn delete_needs_after_current_lookup(opts: &ObjectOptions, existing_object: Option<&ObjectInfo>) -> bool {
+    existing_object.is_some_and(|info| {
+        if opts.version_id.is_some() {
+            return info.is_latest;
+        }
+
+        opts.version_suspended && info.delete_marker && object_info_is_null_version(info)
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WriteMemoryUpdate {
     pub(crate) creates_current_object: bool,
@@ -1119,7 +1129,9 @@ fn delete_memory_deltas_for_result(
             info.delete_marker
                 && normalized_null_version_id(info.version_id) == normalized_null_version_id(result_delete_marker_version_id)
         });
-    let removes_delete_marker = opts.version_id.is_some() && existing_object.is_some_and(|info| info.delete_marker);
+    let removes_delete_marker = existing_object.is_some_and(|info| {
+        info.delete_marker && (opts.version_id.is_some() || (opts.version_suspended && object_info_is_null_version(info)))
+    });
 
     let before_current_visible = existing_object.is_some_and(|info| {
         if opts.version_id.is_some() {
@@ -1128,7 +1140,7 @@ fn delete_memory_deltas_for_result(
             !info.delete_marker
         }
     });
-    let after_current_visible = if opts.version_id.is_some() && existing_object.is_some_and(|info| info.is_latest) {
+    let after_current_visible = if delete_needs_after_current_lookup(opts, existing_object) {
         after_current_object.is_some_and(|info| !info.delete_marker)
     } else if opts.version_id.is_some() {
         before_current_visible
@@ -1957,10 +1969,7 @@ impl DefaultObjectUsecase {
             .await
             .map_err(ApiError::from)?;
         let previous_current_info = match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => {
-                validate_existing_object_lock_for_write(&existing_obj_info)?;
-                Some(existing_obj_info)
-            }
+            Ok(existing_obj_info) => Some(existing_obj_info),
             Err(err) => {
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                     return Err(ApiError::from(err).into());
@@ -1969,6 +1978,11 @@ impl DefaultObjectUsecase {
             }
         };
         let quota_previous_current_size = quota_replaced_size_for_write(&opts, previous_current_info.as_ref());
+        if quota_previous_current_size.is_some()
+            && let Some(existing_obj_info) = previous_current_info.as_ref()
+        {
+            validate_existing_object_lock_for_write(existing_obj_info)?;
+        }
 
         let actual_size = size;
         self.check_bucket_quota_for_write(
@@ -2841,10 +2855,7 @@ impl DefaultObjectUsecase {
             .await
             .map_err(ApiError::from)?;
         let previous_current_info = match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => {
-                validate_existing_object_lock_for_write(&existing_obj_info)?;
-                Some(existing_obj_info)
-            }
+            Ok(existing_obj_info) => Some(existing_obj_info),
             Err(err) => {
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                     return Err(ApiError::from(err).into());
@@ -2852,6 +2863,12 @@ impl DefaultObjectUsecase {
                 None
             }
         };
+        let quota_previous_current_size = quota_replaced_size_for_write(&dst_opts, previous_current_info.as_ref());
+        if quota_previous_current_size.is_some()
+            && let Some(existing_obj_info) = previous_current_info.as_ref()
+        {
+            validate_existing_object_lock_for_write(existing_obj_info)?;
+        }
 
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
         let mut effective_sse = requested_sse.or_else(|| {
@@ -3011,7 +3028,6 @@ impl DefaultObjectUsecase {
             src_info.user_defined.insert(k, v);
         }
 
-        let quota_previous_current_size = quota_replaced_size_for_write(&dst_opts, previous_current_info.as_ref());
         self.check_bucket_quota_for_write(
             &bucket,
             QuotaOperation::CopyObject,
@@ -3298,8 +3314,7 @@ impl DefaultObjectUsecase {
                     version_suspended: version_cfg.suspended(),
                     ..Default::default()
                 };
-                let after_current_info = if accounting_opts.version_id.is_some()
-                    && existing_object_infos[i].as_ref().is_some_and(|info| info.is_latest)
+                let after_current_info = if delete_needs_after_current_lookup(&accounting_opts, existing_object_infos[i].as_ref())
                 {
                     match get_opts(&bucket, &object_to_delete[i].object_name, None, None, &req.headers).await {
                         Ok(current_opts) => match store
@@ -3552,8 +3567,7 @@ impl DefaultObjectUsecase {
         enqueue_transitioned_delete_cleanup(&bucket, &key, &opts, existing_object_info.as_ref()).await;
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        let after_current_info = if opts.version_id.is_some() && existing_object_info.as_ref().is_some_and(|info| info.is_latest)
-        {
+        let after_current_info = if delete_needs_after_current_lookup(&opts, existing_object_info.as_ref()) {
             match crate::storage::options::get_opts(&bucket, &key, None, None, &req.headers).await {
                 Ok(current_opts) => match store.get_object_info(&bucket, &key, &current_opts).await {
                     Ok(info) => Some(info),
@@ -4494,10 +4508,7 @@ impl DefaultObjectUsecase {
                 .await
                 .map_err(ApiError::from)?;
             let previous_current_info = match store.get_object_info(&bucket, &fpath, &current_opts).await {
-                Ok(existing_obj_info) => {
-                    validate_existing_object_lock_for_write(&existing_obj_info)?;
-                    Some(existing_obj_info)
-                }
+                Ok(existing_obj_info) => Some(existing_obj_info),
                 Err(err) => {
                     if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                         return Err(ApiError::from(err).into());
@@ -4506,6 +4517,11 @@ impl DefaultObjectUsecase {
                 }
             };
             let quota_previous_current_size = quota_replaced_size_for_write(&opts, previous_current_info.as_ref());
+            if quota_previous_current_size.is_some()
+                && let Some(existing_obj_info) = previous_current_info.as_ref()
+            {
+                validate_existing_object_lock_for_write(existing_obj_info)?;
+            }
 
             let actual_size = size;
             self.check_bucket_quota_for_write(
@@ -4865,6 +4881,25 @@ mod tests {
         assert_eq!(marker_removal.current_objects_delta, 1);
         assert_eq!(marker_removal.versions_delta, 0);
         assert_eq!(marker_removal.delete_markers_delta, -1);
+
+        let suspended_null_delete_marker = ObjectInfo {
+            version_id: Some(Uuid::nil()),
+            delete_marker: true,
+            is_latest: true,
+            ..Default::default()
+        };
+        assert!(delete_needs_after_current_lookup(&suspended, Some(&suspended_null_delete_marker)));
+        let suspended_marker_removal = delete_memory_deltas_for_result(
+            &suspended,
+            Some(&suspended_null_delete_marker),
+            true,
+            suspended_null_delete_marker.version_id,
+            Some(&exposed_current),
+        );
+        assert_eq!(suspended_marker_removal.deleted_size, 0);
+        assert_eq!(suspended_marker_removal.current_objects_delta, 1);
+        assert_eq!(suspended_marker_removal.versions_delta, 0);
+        assert_eq!(suspended_marker_removal.delete_markers_delta, -1);
     }
 
     #[tokio::test]
